@@ -43,10 +43,13 @@ class Round:
     round_id: str
     station_id: str
     sql: str
+    with_parquet: bool = False
     state: str = PENDING
     error: Optional[str] = None
     result_csv: Optional[bytes] = None
+    result_parquet: Optional[bytes] = None
     result_bytes: int = 0
+    parquet_bytes: int = 0
     row_count: int = 0
     created_at: float = field(default_factory=time.monotonic)
     finished_at: Optional[float] = None
@@ -62,6 +65,7 @@ class Round:
             "round_id": self.round_id,
             "station_id": self.station_id,
             "state": self.state,
+            "with_parquet": self.with_parquet,
             "cancel_requested": self.cancel_requested,
             "elapsed_ms": int(
                 ((self.finished_at or time.monotonic()) - self.created_at) * 1000
@@ -73,6 +77,14 @@ class Round:
                 row_count=self.row_count,
                 download_url=f"/api/rounds/{self.round_id}/result",
             )
+            if self.with_parquet:
+                # Both files were generated before the round was published,
+                # so both downloads open at the same moment.
+                data.update(
+                    parquet_bytes=self.parquet_bytes,
+                    total_bytes=self.result_bytes + self.parquet_bytes,
+                    download_url_parquet=f"/api/rounds/{self.round_id}/result.parquet",
+                )
         if self.error:
             data["error"] = self.error
         return data
@@ -91,7 +103,13 @@ class RoundRegistry:
                 1 for r in self._rounds.values() if r.state not in _TERMINAL_STATES
             )
 
-    def submit(self, station_id: str, sql: str, columns: dict[str, list]) -> Round:
+    def submit(
+        self,
+        station_id: str,
+        sql: str,
+        columns: dict[str, list],
+        with_parquet: bool = False,
+    ) -> Round:
         with self._lock:
             if self.active_count() >= self._max_active:
                 raise SlotsFullError(
@@ -102,8 +120,9 @@ class RoundRegistry:
                 round_id=round_id,
                 station_id=station_id,
                 sql=sql,
+                with_parquet=with_parquet,
             )
-            worker = QueryWorker(round_id, sql, columns)
+            worker = QueryWorker(round_id, sql, columns, with_parquet=with_parquet)
             watchdog = threading.Timer(
                 QUERY_TIMEOUT_SECONDS, self._on_timeout, args=(round_id,)
             )
@@ -166,32 +185,38 @@ class RoundRegistry:
             if round_obj.cancel_requested:
                 round_obj.state = CANCELLED
                 round_obj.error = "round cancelled; result discarded"
-                round_obj.result_csv = None
             elif round_obj._timeout_happened:
                 round_obj.state = FAILED
                 round_obj.error = (
                     f"query exceeded {QUERY_TIMEOUT_SECONDS:.0f} s and was terminated; "
                     "no partial results are available"
                 )
-                round_obj.result_csv = None
             elif worker_result is None:
                 round_obj.state = FAILED
                 round_obj.error = "query worker exited without producing a result"
-                round_obj.result_csv = None
             elif worker_result.kind == MSG_DONE:
                 round_obj.state = SUCCEEDED
                 round_obj.result_csv = worker_result.csv_bytes
                 round_obj.result_bytes = worker_result.result_bytes
                 round_obj.row_count = worker_result.row_count
                 round_obj.error = None
+                if round_obj.with_parquet:
+                    round_obj.result_parquet = worker_result.parquet_bytes
+                    round_obj.parquet_bytes = worker_result.parquet_result_bytes
             elif worker_result.kind == MSG_TOO_LARGE:
                 round_obj.state = FAILED
                 round_obj.error = worker_result.error
-                round_obj.result_csv = None
             else:
                 round_obj.state = FAILED
                 round_obj.error = worker_result.error or "query failed"
+
+            if round_obj.state != SUCCEEDED:
+                # Failed / cancelled / timed-out rounds publish nothing:
+                # neither CSV nor Parquet is downloadable.
                 round_obj.result_csv = None
+                round_obj.result_parquet = None
+                round_obj.result_bytes = 0
+                round_obj.parquet_bytes = 0
 
             round_obj.finished_at = time.monotonic()
             round_obj._worker = None

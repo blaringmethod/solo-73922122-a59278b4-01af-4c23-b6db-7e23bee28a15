@@ -17,6 +17,14 @@ DuckDB's native ``connection.interrupt()`` is used to abort a running query
 immediately; the worker surfaces it as an ordinary failure and no partial
 output is ever published. A watchdog additionally interrupts at the 5 s
 deadline so a slow query cannot block anything else.
+
+Dual CSV + Parquet output
+-------------------------
+When a round requests Parquet delivery, the query still executes exactly
+once: the worker streams batches from a single cursor and serialises each
+batch to CSV text and to an in-memory Parquet writer. The round succeeds
+only if both files are complete and their combined size stays within the
+8 MiB budget; otherwise nothing is published.
 """
 from __future__ import annotations
 
@@ -44,9 +52,11 @@ MSG_TOO_LARGE = "too_large"
 class WorkerResult:
     kind: str
     csv_bytes: bytes = b""
+    parquet_bytes: bytes = b""
     row_count: int = 0
     error: str = ""
     result_bytes: int = 0
+    parquet_result_bytes: int = 0
 
 
 def _locked_connection() -> duckdb.DuckDBPyConnection:
@@ -108,11 +118,18 @@ def _format_csv(columns: list[str], rows: list[tuple]) -> bytes:
 class QueryWorker(threading.Thread):
     """Runs one validated query to completion or interruption."""
 
-    def __init__(self, round_id: str, sql: str, columns: dict[str, list]) -> None:
+    def __init__(
+        self,
+        round_id: str,
+        sql: str,
+        columns: dict[str, list],
+        with_parquet: bool = False,
+    ) -> None:
         super().__init__(name=f"query-{round_id[:8]}", daemon=True)
         self.round_id = round_id
         self._sql = sql
         self._columns = columns
+        self._with_parquet = with_parquet
         self._con: Optional[duckdb.DuckDBPyConnection] = None
         self._interrupted = threading.Event()
         self._lock = threading.Lock()
@@ -187,38 +204,108 @@ class QueryWorker(threading.Thread):
             )
             return
 
+        # When Parquet delivery is requested, both files are serialised from
+        # this one cursor stream: the SQL runs exactly once and CSV/Parquet
+        # share columns, column order, row order and duplicate rows.
+        parquet_builder = None
+        if self._with_parquet:
+            # Imported lazily so plain CSV rounds never touch pyarrow.
+            from .parquet_io import (
+                ParquetSchemaError,
+                StreamingParquetBuilder,
+                build_schema,
+            )
+
+            duckdb_types = [str(d[1]) for d in description]
+            try:
+                schema = build_schema(result_columns, duckdb_types)
+            except ParquetSchemaError as exc:
+                # Duplicate column names / unsupported types: the message
+                # names the responsible column(s); the whole round fails.
+                self.result = WorkerResult(MSG_ERROR, error=str(exc))
+                return
+            parquet_builder = StreamingParquetBuilder(schema)
+
         chunks: list[bytes] = [_csv_header(result_columns)]
-        total_bytes = len(chunks[0])
+        csv_total = len(chunks[0])
         total_rows = 0
 
-        while True:
-            if self._interrupted.is_set():
-                self.result = WorkerResult(
-                    MSG_ERROR, error="query was interrupted; no partial result"
-                )
-                return
-            batch = cur.fetchmany(BATCH_SIZE)
-            if not batch:
-                break
-            chunk = _format_csv(result_columns, batch)
-            total_bytes += len(chunk)
-            total_rows += len(batch)
-            if total_bytes > MAX_RESULT_BYTES:
-                # Whole round fails; accumulated chunks are discarded.
+        try:
+            while True:
+                if self._interrupted.is_set():
+                    if parquet_builder is not None:
+                        parquet_builder.abort()
+                    self.result = WorkerResult(
+                        MSG_ERROR, error="query was interrupted; no partial result"
+                    )
+                    return
+                batch = cur.fetchmany(BATCH_SIZE)
+                if not batch:
+                    break
+                chunk = _format_csv(result_columns, batch)
+                csv_total += len(chunk)
+                total_rows += len(batch)
+                if parquet_builder is not None:
+                    parquet_builder.write_batch(batch)
+                    combined = csv_total + parquet_builder.bytes_so_far
+                    if combined > MAX_RESULT_BYTES:
+                        # Whole round fails; accumulated output is discarded.
+                        parquet_builder.abort()
+                        self.result = WorkerResult(
+                            MSG_TOO_LARGE,
+                            error=(
+                                f"combined CSV+Parquet size exceeds "
+                                f"{MAX_RESULT_BYTES} bytes (8 MiB); the whole "
+                                "round failed and no files are kept"
+                            ),
+                            result_bytes=combined,
+                        )
+                        return
+                elif csv_total > MAX_RESULT_BYTES:
+                    # Whole round fails; accumulated chunks are discarded.
+                    self.result = WorkerResult(
+                        MSG_TOO_LARGE,
+                        error=(
+                            f"result CSV exceeds {MAX_RESULT_BYTES} bytes "
+                            "(8 MiB); the whole round failed and no result is kept"
+                        ),
+                        result_bytes=csv_total,
+                    )
+                    return
+                chunks.append(chunk)
+        except Exception:
+            if parquet_builder is not None:
+                parquet_builder.abort()
+            raise
+
+        csv_payload = b"".join(chunks)
+        if parquet_builder is not None:
+            parquet_payload = parquet_builder.finish()
+            combined = csv_total + len(parquet_payload)
+            if combined > MAX_RESULT_BYTES:
                 self.result = WorkerResult(
                     MSG_TOO_LARGE,
                     error=(
-                        f"result CSV exceeds {MAX_RESULT_BYTES} bytes "
-                        "(8 MiB); the whole round failed and no result is kept"
+                        f"combined CSV+Parquet size exceeds "
+                        f"{MAX_RESULT_BYTES} bytes (8 MiB); the whole round "
+                        "failed and no files are kept"
                     ),
-                    result_bytes=total_bytes,
+                    result_bytes=combined,
                 )
                 return
-            chunks.append(chunk)
+            self.result = WorkerResult(
+                MSG_DONE,
+                csv_bytes=csv_payload,
+                parquet_bytes=parquet_payload,
+                row_count=total_rows,
+                result_bytes=csv_total,
+                parquet_result_bytes=len(parquet_payload),
+            )
+            return
 
         self.result = WorkerResult(
             MSG_DONE,
-            csv_bytes=b"".join(chunks),
+            csv_bytes=csv_payload,
             row_count=total_rows,
-            result_bytes=total_bytes,
+            result_bytes=csv_total,
         )

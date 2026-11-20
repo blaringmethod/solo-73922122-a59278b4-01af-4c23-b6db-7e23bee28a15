@@ -37,7 +37,8 @@ app = FastAPI(
     title="观测数据 SQL 清洗沙箱",
     description=(
         "上传观测 CSV，按站点提交只读 SELECT/WITH 查询。每轮独立隔离、"
-        "最多两轮并行、5 秒超时、结果上限 8 MiB。"
+        "最多两轮并行、5 秒超时、结果上限 8 MiB；可勾选同时生成 Parquet"
+        "（与 CSV 同一次执行、合计限 8 MiB）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -47,6 +48,9 @@ app = FastAPI(
 class SqlSubmission(BaseModel):
     station_id: str
     sql: str
+    # When true the round also produces a Parquet file from the same single
+    # execution; both downloads open only after both files are complete.
+    with_parquet: bool = False
 
 
 @app.get("/")
@@ -112,7 +116,12 @@ async def create_round(submission: SqlSubmission) -> JSONResponse:
         )
 
     try:
-        round_obj = registry.submit(station_id, validated.text, columns)
+        round_obj = registry.submit(
+            station_id,
+            validated.text,
+            columns,
+            with_parquet=submission.with_parquet,
+        )
     except SlotsFullError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return JSONResponse(status_code=201, content=round_obj.public_dict())
@@ -162,5 +171,33 @@ def download_result(round_id: str) -> Response:
     return Response(
         content=round_obj.result_csv,
         media_type="text/csv; charset=utf-8",
+        headers=headers,
+    )
+
+
+@app.get("/api/rounds/{round_id}/result.parquet")
+def download_result_parquet(round_id: str) -> Response:
+    try:
+        round_obj = registry.get(round_id)
+    except RoundNotFound:
+        raise HTTPException(status_code=404, detail="轮次不存在或已被清理") from None
+    if round_obj.state != SUCCEEDED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"轮次当前状态为 {round_obj.state}，没有可下载的结果；失败/超时/取消不提供任何文件",
+        )
+    if not round_obj.with_parquet or round_obj.result_parquet is None:
+        raise HTTPException(
+            status_code=404,
+            detail="该轮未勾选「同时生成 Parquet」，没有 Parquet 文件",
+        )
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="result_{round_id[:8]}.parquet"'
+        )
+    }
+    return Response(
+        content=round_obj.result_parquet,
+        media_type="application/vnd.apache.parquet",
         headers=headers,
     )

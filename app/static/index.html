@@ -63,6 +63,12 @@
   .slot.busy { background:var(--accent); border-color:var(--accent); }
   .mini { padding:5px 12px; font-size:12px; }
   .err-text { color:#fca5a5; font-size:12px; margin-top:6px; word-break:break-all; }
+  .check { display:flex; align-items:center; gap:8px; margin-top:12px;
+           font-size:13px; color:var(--fg); cursor:pointer; }
+  .check input[type=checkbox] { width:16px; height:16px; accent-color:var(--accent);
+           cursor:pointer; }
+  .check .hint { color:var(--muted); font-size:12px; }
+  .dl-stack { display:flex; flex-direction:column; gap:4px; }
 </style>
 </head>
 <body>
@@ -85,7 +91,7 @@
     <div class="limits">
       <span>并行名额：<b id="slotText">0 / 2</b></span>
       <span>单轮超时：<b>5 秒（硬终止）</b></span>
-      <span>结果上限：<b>8 MiB（超限整轮失败）</b></span>
+      <span>结果上限：<b>8 MiB（勾选时 CSV+Parquet 合计，超限整轮失败）</b></span>
       <span>隔离：<b>每轮独立子进程 + 独立内存库</b></span>
     </div>
   </section>
@@ -107,6 +113,11 @@
       <code data-sql="SELECT station_id, COUNT(*) AS n,&#10;       ROUND(AVG(temperature_c), 2) AS avg_t,&#10;       ROUND(MIN(temperature_c), 2) AS min_t,&#10;       ROUND(MAX(temperature_c), 2) AS max_t&#10;FROM observations&#10;GROUP BY station_id">聚合</code> ·
       <code data-sql="WITH a AS (SELECT ts_utc, temperature_c FROM observations),&#10;     b AS (SELECT ts_utc, temperature_c AS prev_t FROM observations)&#10;SELECT a.ts_utc, a.temperature_c, b.prev_t&#10;FROM a JOIN b ON a.ts_utc = b.ts_utc">WITH 自连接</code>
     </div>
+    <label class="check" for="withParquet">
+      <input type="checkbox" id="withParquet" />
+      同时生成 Parquet（供下游直接入仓）
+      <span class="hint">与 CSV 来自同一次执行；支持 BOOLEAN / INTEGER / BIGINT / DOUBLE / DECIMAL / DATE / TIMESTAMP / VARCHAR；两份文件合计 ≤ 8 MiB，全部成功后同时开放下载</span>
+    </label>
     <div class="actions">
       <button id="submitBtn" disabled>提交 SQL（创建一轮）</button>
       <button id="refreshBtn" class="ghost">刷新状态</button>
@@ -115,7 +126,7 @@
   </section>
 
   <section class="card">
-    <h2>③ 轮次状态 <span class="tag">可查询、可取消；成功后可下载结果 CSV</span></h2>
+    <h2>③ 轮次状态 <span class="tag">可查询、可取消；成功后可下载结果（勾选时 CSV + Parquet 同时开放）</span></h2>
     <div class="slotbar" style="margin-bottom:10px">
       名额
       <span class="slot" id="slot0"></span><span class="slot" id="slot1"></span>
@@ -196,10 +207,14 @@ $("submitBtn").onclick = async () => {
     const data = await api("/api/rounds", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ station_id: $("station").value, sql })
+      body: JSON.stringify({
+        station_id: $("station").value,
+        sql,
+        with_parquet: $("withParquet").checked
+      })
     });
     showMsg($("submitMsg"), "已创建轮次 " + data.round_id.slice(0, 8) +
-      "，状态 " + data.state, "info");
+      "，状态 " + data.state + (data.with_parquet ? "（含 Parquet）" : ""), "info");
     refreshRounds();
   } catch (e) {
     const kind = e.status === 503 ? "err" : "err";
@@ -246,12 +261,17 @@ async function refreshRounds() {
   [...data.rounds].reverse().forEach((r) => {
     const tr = document.createElement("tr");
     const running = r.state === "running" || r.state === "pending";
-    const size = r.state === "succeeded"
-      ? (r.row_count + " 行 / " + (r.result_bytes / 1024).toFixed(1) + " KiB")
-      : "—";
+    let size = "—";
+    if (r.state === "succeeded") {
+      size = r.row_count + " 行 / " + (r.result_bytes / 1024).toFixed(1) + " KiB";
+      if (r.with_parquet) {
+        size = r.row_count + " 行 / CSV " + (r.result_bytes / 1024).toFixed(1) +
+          " KiB + Parquet " + (r.parquet_bytes / 1024).toFixed(1) + " KiB";
+      }
+    }
     const note = r.error || (r.cancel_requested && running ? "取消请求已受理，等待进程退出…" : "");
     tr.innerHTML =
-      "<td>" + r.round_id.slice(0, 8) + "</td>" +
+      "<td>" + r.round_id.slice(0, 8) + (r.with_parquet ? '<div style="color:var(--muted);font-size:11px">CSV+Parquet</div>' : "") + "</td>" +
       "<td>" + escapeHtml(r.station_id) + "</td>" +
       '<td><span class="pill ' + r.state + '">' + r.state +
       (r.cancel_requested && running ? "（取消中）" : "") + "</span></td>" +
@@ -267,11 +287,21 @@ async function refreshRounds() {
       btn.onclick = () => cancelRound(r.round_id);
       actionTd.appendChild(btn);
     } else if (r.state === "succeeded") {
+      const stack = document.createElement("div");
+      stack.className = "dl-stack";
       const a = document.createElement("a");
       a.className = "dl";
       a.href = r.download_url;
       a.textContent = "下载结果 CSV";
-      actionTd.appendChild(a);
+      stack.appendChild(a);
+      if (r.with_parquet && r.download_url_parquet) {
+        const ap = document.createElement("a");
+        ap.className = "dl";
+        ap.href = r.download_url_parquet;
+        ap.textContent = "下载结果 Parquet";
+        stack.appendChild(ap);
+      }
+      actionTd.appendChild(stack);
     }
     body.appendChild(tr);
   });
